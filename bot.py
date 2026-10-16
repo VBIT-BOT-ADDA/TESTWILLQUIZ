@@ -835,24 +835,30 @@ async def run_next_question(update, context):
     if existing:
         elapsed = time.time() - existing.get("start_time", 0)
         old_quiz_id = str(existing.get("quiz_id", ""))
-        old_timer = int(existing.get("timer", 60) or 60)
+        old_timer = int(existing.get("timer", 15) or 15)
+        old_questions = existing.get("questions") or []
 
-        # Recover automatically from a stale session left behind after a
-        # restart/network error. A normal quiz should finish before this.
-        stale_after = max(300, old_timer * 100 + 120)
+        # A quiz session should last approximately timer * question-count.
+        # The previous, much larger timeout could leave an ended quiz marked
+        # as running for many extra minutes (especially long quizzes).
+        expected_questions = len(old_questions)
+        if not expected_questions:
+            old_quiz = database.get_quiz_by_id(old_quiz_id)
+            expected_questions = len(old_quiz.get("questions", [])) if old_quiz else 1
+        stale_after = max(180, old_timer * max(1, expected_questions) + 45)
+
         if elapsed > stale_after:
             active_sessions.pop(key, None)
             existing = None
         elif old_quiz_id == str(quiz_id):
             await query.answer(
-                "This quiz is already running in this chat.",
+                "This quiz is already running in this chat. Use /stop to reset it if it is stuck.",
                 show_alert=True,
             )
             return
         else:
-            # Allow a different quiz to replace an abandoned/previous one
-            # in this same chat, while the old auto-advance task self-cancels
-            # after checking the session's current poll ID.
+            # Replace an abandoned/previous quiz in this same chat. Its
+            # timer task will stop when it no longer finds its session key.
             active_sessions.pop(key, None)
 
     await query.answer()
@@ -1327,7 +1333,7 @@ def main():
     )
 
     logger.info(
-        "Quiz Bot started with force-subscription made by @llMR_BADALll, "
+        "Quiz Bot started with force-subscription made by @lVAMPIRE_KINGlll, "
         "native Quiz Polls, MongoDB and auto-next questions."
     )
 
