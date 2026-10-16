@@ -481,11 +481,29 @@ async def process_question(update, context):
 
     current_quiz = context.user_data["current_quiz"]
 
+    # Bot API 9.6 replaced correct_option_id with correct_option_ids.
+    # Keep compatibility with older polls/database records too.
+    correct_ids = getattr(poll, "correct_option_ids", None)
+    if correct_ids is None:
+        legacy_correct_id = getattr(poll, "correct_option_id", None)
+        correct_ids = [legacy_correct_id] if legacy_correct_id is not None else []
+    else:
+        correct_ids = list(correct_ids)
+
+    if not correct_ids:
+        await update.message.reply_text(
+            "❌ Telegram did not provide the correct answer for this quiz poll. "
+            "Please recreate the question and select the correct option."
+        )
+        return QUESTIONS
+
     current_quiz["questions"].append(
         {
             "question": poll.question,
             "options": [option.text for option in poll.options],
-            "correct_option_id": poll.correct_option_id,
+            # Save both names for compatibility with old code/data.
+            "correct_option_id": int(correct_ids[0]),
+            "correct_option_ids": [int(item) for item in correct_ids],
             "explanation": poll.explanation or "",
         }
     )
@@ -930,18 +948,54 @@ async def send_question(
 
     q = questions[q_idx]
 
+    options = [str(option).strip() for option in (q.get("options") or [])]
+    # Support both newly saved records and old MongoDB quiz records.
+    correct_ids = q.get("correct_option_ids")
+    if correct_ids is None:
+        legacy_id = q.get("correct_option_id")
+        correct_ids = [legacy_id] if legacy_id is not None else []
+    try:
+        correct_ids = sorted({int(item) for item in correct_ids if item is not None})
+    except (TypeError, ValueError):
+        correct_ids = []
+
+    if not (2 <= len(options) <= 12) or any(not item for item in options):
+        logger.error("Skipping invalid quiz question %s: invalid options", q_idx)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"❌ Question {q_idx + 1} has invalid answer options in the database. "
+                "Please edit/recreate this question."
+            ),
+        )
+        active_sessions.pop(session_key(user_id, chat_id), None)
+        return
+
+    if not correct_ids or any(item < 0 or item >= len(options) for item in correct_ids):
+        logger.error("Skipping invalid quiz question %s: correct options missing/out of range", q_idx)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"❌ Question {q_idx + 1} has no valid correct answer saved. "
+                "Please recreate that question and select its correct answer."
+            ),
+        )
+        active_sessions.pop(session_key(user_id, chat_id), None)
+        return
+
     poll_msg = await context.bot.send_poll(
         chat_id=chat_id,
         question=(
             f"[{q_idx + 1}/{len(questions)}] "
             f"{q['question']}"
-        ),
-        options=q["options"],
+        )[:300],
+        options=options,
         type=Poll.QUIZ,
-        correct_option_id=q["correct_option_id"],
-        explanation=q.get("explanation") or None,
+        # Bot API 9.6 uses correct_option_ids; singular correct_option_id is deprecated.
+        correct_option_ids=correct_ids,
+        explanation=(q.get("explanation") or None),
         is_anonymous=False,
-        open_period=int(quiz["timer"]),
+        open_period=max(5, min(600, int(quiz.get("timer", 15) or 15))),
         allows_multiple_answers=False,
     )
 
@@ -951,7 +1005,8 @@ async def send_question(
         "user_id": user_id,
         "quiz_id": str(quiz_id),
         "q_idx": q_idx,
-        "correct_id": q["correct_option_id"],
+        "correct_ids": set(correct_ids),
+        "correct_id": correct_ids[0],
         "chat_id": chat_id,
     }
 
@@ -1064,7 +1119,8 @@ async def handle_poll_answer(update, context):
         else -1
     )
 
-    if selected == poll_info["correct_id"]:
+    correct_ids = poll_info.get("correct_ids") or {poll_info.get("correct_id")}
+    if selected in correct_ids:
         session["correct"] += 1
     else:
         session["wrong"] += 1
@@ -1333,7 +1389,7 @@ def main():
     )
 
     logger.info(
-        "Quiz Bot started with force-subscription made by @lVAMPIRE_KINGlll, "
+        "Quiz Bot started with force-subscription made by @llMR_BADALll, "
         "native Quiz Polls, MongoDB and auto-next questions."
     )
 
