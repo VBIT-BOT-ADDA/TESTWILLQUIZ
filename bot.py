@@ -39,6 +39,11 @@ QUESTIONS, TIMER, SHUFFLE = range(3)
 active_sessions = {}
 
 
+def session_key(user_id, chat_id):
+    """Keep each user's quiz session separate for each chat."""
+    return (int(user_id), int(chat_id))
+
+
 # ============================================================
 # FORCE SUBSCRIBE CONFIG
 # ============================================================
@@ -821,23 +826,46 @@ async def run_next_question(update, context):
         return
 
     user_id = update.effective_user.id
+    chat_id = query.message.chat_id
+    key = session_key(user_id, chat_id)
 
-    if user_id in active_sessions:
-        await query.answer(
-            "A quiz is already running for you.",
-            show_alert=True,
-        )
-        return
+    # A user may play in a private chat and in a group independently.
+    # Only block a duplicate start for the same user in the same chat.
+    existing = active_sessions.get(key)
+    if existing:
+        elapsed = time.time() - existing.get("start_time", 0)
+        old_quiz_id = str(existing.get("quiz_id", ""))
+        old_timer = int(existing.get("timer", 60) or 60)
+
+        # Recover automatically from a stale session left behind after a
+        # restart/network error. A normal quiz should finish before this.
+        stale_after = max(300, old_timer * 100 + 120)
+        if elapsed > stale_after:
+            active_sessions.pop(key, None)
+            existing = None
+        elif old_quiz_id == str(quiz_id):
+            await query.answer(
+                "This quiz is already running in this chat.",
+                show_alert=True,
+            )
+            return
+        else:
+            # Allow a different quiz to replace an abandoned/previous one
+            # in this same chat, while the old auto-advance task self-cancels
+            # after checking the session's current poll ID.
+            active_sessions.pop(key, None)
 
     await query.answer()
 
-    active_sessions[user_id] = {
+    active_sessions[key] = {
         "start_time": time.time(),
         "correct": 0,
         "wrong": 0,
         "current_q": -1,
         "quiz_id": str(quiz_id),
-        "chat_id": query.message.chat_id,
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "timer": int(quiz.get("timer", 15) or 15),
         "answered_polls": set(),
     }
 
@@ -860,14 +888,14 @@ async def send_question(
     quiz = database.get_quiz_by_id(quiz_id)
 
     if not quiz:
-        active_sessions.pop(user_id, None)
+        active_sessions.pop(session_key(user_id, chat_id), None)
         await context.bot.send_message(
             chat_id=chat_id,
             text="❌ Quiz not found.",
         )
         return
 
-    session = active_sessions.get(user_id)
+    session = active_sessions.get(session_key(user_id, chat_id))
 
     if not session:
         return
@@ -951,7 +979,7 @@ async def auto_advance_question(
     except asyncio.CancelledError:
         return
 
-    session = active_sessions.get(user_id)
+    session = active_sessions.get(session_key(user_id, chat_id))
 
     if not session:
         return
@@ -962,7 +990,7 @@ async def auto_advance_question(
     quiz = database.get_quiz_by_id(quiz_id)
 
     if not quiz:
-        active_sessions.pop(user_id, None)
+        active_sessions.pop(session_key(user_id, chat_id), None)
         return
 
     next_q_idx = q_idx + 1
@@ -1006,7 +1034,10 @@ async def handle_poll_answer(update, context):
     if answer.user.id != user_id:
         return
 
-    session = active_sessions.get(user_id)
+    chat_id = poll_info.get("chat_id")
+    if chat_id is None:
+        return
+    session = active_sessions.get(session_key(user_id, chat_id))
 
     if not session:
         return
@@ -1039,7 +1070,7 @@ async def finish_quiz_results(
     chat_id,
     quiz,
 ):
-    session = active_sessions.get(user_id)
+    session = active_sessions.get(session_key(user_id, chat_id))
 
     if not session:
         return
@@ -1114,16 +1145,18 @@ async def finish_quiz_results(
     )
 
     active_sessions.pop(
-        user_id,
+        session_key(user_id, chat_id),
         None,
     )
 
 
 async def stop_command(update, context):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    key = session_key(user_id, chat_id)
 
-    if user_id in active_sessions:
-        active_sessions.pop(user_id, None)
+    if key in active_sessions:
+        active_sessions.pop(key, None)
 
         await update.message.reply_text(
             "🛑 <b>Active quiz session stopped.</b>",
@@ -1131,7 +1164,7 @@ async def stop_command(update, context):
         )
     else:
         await update.message.reply_text(
-            "ℹ️ No active quiz session."
+            "ℹ️ No active quiz session in this chat."
         )
 
 
